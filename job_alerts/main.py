@@ -14,6 +14,9 @@ import xml.etree.ElementTree as ET
 
 import requests
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 ROOT = Path(__file__).resolve().parent
 STATE_PATH = ROOT / "state.json"
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -38,7 +41,7 @@ QUERIES = [
 ]
 
 HEADERS = {"User-Agent": "HarshTelegramJobAlerts/1.0 (RSS reader)"}
-MAX_ITEMS = 18
+MAX_ITEMS = 15
 STATE_MAX = 1500
 
 
@@ -96,52 +99,146 @@ def fetch_query(query: str) -> list[dict]:
 
     items = []
     for node in root.findall(".//item"):
-        title = clean_text(node.findtext("title", ""))
+        raw_title = clean_text(node.findtext("title", ""))
         link = clean_text(node.findtext("link", ""))
         source_node = node.find("source")
         source = clean_text(source_node.text if source_node is not None and source_node.text else "")
         published = parse_pubdate(node.findtext("pubDate", ""))
-        description = clean_text(node.findtext("description", ""))
-        if not title or not link:
+        raw_description = clean_text(node.findtext("description", ""))
+
+        if not raw_title or not link:
             continue
+
+        # Clean source suffix from title if present
+        title = raw_title
+        if " - " in title:
+            candidate_title, candidate_source = title.rsplit(" - ", 1)
+            if not source:
+                source = candidate_source.strip()
+                title = candidate_title.strip()
+            elif candidate_source.strip().lower() == source.lower():
+                title = candidate_title.strip()
+
+        source = source or "Google News RSS"
+
+        # Discard description if it's merely repeating the title/source or empty
+        desc = raw_description
+        if desc and (desc.lower() == raw_title.lower() or desc.lower() == f"{raw_title} {source}".lower()):
+            desc = ""
+        elif len(desc) > 130:
+            desc = desc[:127].rsplit(" ", 1)[0] + "..."
+
         key = re.sub(r"[^a-z0-9]+", " ", (title + " " + source).lower()).strip()
         items.append({
             "key": key[:220],
             "title": title,
             "link": link,
-            "source": source or "Google News RSS",
+            "source": source,
             "published": published,
-            "description": description[:320],
+            "description": desc,
             "query": query,
         })
     return items
 
 
-def telegram_send(text: str) -> None:
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    # Telegram message length limit is 4096 characters; split safely by lines.
-    chunks, current = [], ""
-    for line in text.splitlines():
-        candidate = (current + "\n" + line).strip() if current else line
-        if len(candidate) > 3800:
-            if current:
-                chunks.append(current)
-            current = line[:3800]
+def format_card(index: int, item: dict) -> str:
+    title = html.escape(item["title"])
+    source = html.escape(item["source"])
+    link = html.escape(item["link"], quote=True)
+    date_str = item["published"].strftime("%d %b, %I:%M %p IST") if item["published"] else "Date not supplied"
+    snippet = item.get("description", "").strip()
+
+    lines = [
+        f"<b>{index}. {title}</b>",
+        f"🏢 <b>Source:</b> {source}  •  🕒 <i>{date_str}</i>",
+        f"🏷️ <b>Status:</b> ⚠️ <i>Unverified Lead</i>",
+    ]
+    if snippet:
+        lines.append(f"📝 <i>{html.escape(snippet)}</i>")
+    lines.append(f"🔗 <a href=\"{link}\"><b>View Job Lead / Apply ↗</b></a>\n")
+    return "\n".join(lines)
+
+
+def build_messages(edition: str, now: dt.datetime, items: list[dict]) -> list[str]:
+    header = (
+        f"🎯 <b>JOB RADAR — {edition} EDITION</b>\n"
+        f"📅 <i>{now.strftime('%d %b %Y • %I:%M %p IST')}</i>\n"
+        f"📍 <i>Lucknow & ~100km • Remote India • Freshers & Tech</i>\n"
+        f"{'━' * 28}\n\n"
+    )
+
+    footer = (
+        f"{'━' * 28}\n"
+        f"📡 <b>Scope:</b> Software, AI/ML, Data, Internships, Walk-ins, Govt/PSU\n"
+        f"⚠️ <b>Note:</b> Automated leads via public RSS. Verify eligibility and official portal before applying."
+    )
+
+    if not items:
+        next_edition = "8:00 PM IST" if edition == "MORNING" else "8:00 AM IST"
+        return [
+            f"🎯 <b>JOB RADAR — {edition} EDITION</b>\n"
+            f"📅 <i>{now.strftime('%d %b %Y • %I:%M %p IST')}</i>\n"
+            f"{'━' * 28}\n\n"
+            f"ℹ️ <b>No new matching leads found in this scan.</b>\n"
+            f"<i>All current listings have already been reported. Next automated scan at {next_edition}.</i>\n\n"
+            f"{footer}"
+        ]
+
+    messages = []
+    current_body = header
+    current_count = 0
+
+    for idx, item in enumerate(items, 1):
+        card = format_card(idx, item)
+        # Split into chunks of max 7 cards or ~3400 chars for mobile readability
+        if len(current_body) + len(card) > 3400 or current_count >= 7:
+            messages.append(current_body.strip())
+            current_body = (
+                f"🎯 <b>JOB RADAR — {edition} (Part {len(messages) + 1})</b>\n"
+                f"{'━' * 28}\n\n{card}\n"
+            )
+            current_count = 1
         else:
-            current = candidate
-    if current:
-        chunks.append(current)
-    for chunk in chunks:
-        response = requests.post(
-            url,
-            json={"chat_id": CHAT_ID, "text": chunk, "disable_web_page_preview": True},
-            timeout=20,
-        )
-        if not response.ok:
-            raise RuntimeError(f"Telegram send failed ({response.status_code}): {response.text[:300]}")
-        payload = response.json()
-        if not payload.get("ok"):
-            raise RuntimeError(f"Telegram API rejected message: {payload}")
+            current_body += card + "\n"
+            current_count += 1
+
+    if len(current_body) + len(footer) > 3900:
+        messages.append(current_body.strip())
+        messages.append(footer)
+    else:
+        current_body += "\n" + footer
+        messages.append(current_body.strip())
+
+    return messages
+
+
+def telegram_send(text: str, parse_mode: str = "HTML") -> None:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+
+    response = requests.post(url, json=payload, timeout=20)
+    if not response.ok:
+        # Fallback to plain text if Telegram rejects HTML entities
+        if parse_mode == "HTML":
+            print(f"Telegram HTML parse rejected ({response.status_code}), falling back to plain text...", file=sys.stderr)
+            plain = re.sub(r"<[^>]+>", "", text)
+            payload["text"] = plain
+            payload.pop("parse_mode", None)
+            retry_res = requests.post(url, json=payload, timeout=20)
+            if not retry_res.ok:
+                raise RuntimeError(f"Telegram send failed ({retry_res.status_code}): {retry_res.text[:300]}")
+            return
+        raise RuntimeError(f"Telegram send failed ({response.status_code}): {response.text[:300]}")
+
+    payload_res = response.json()
+    if not payload_res.get("ok"):
+        raise RuntimeError(f"Telegram API rejected message: {payload_res}")
 
 
 def main() -> int:
@@ -151,14 +248,14 @@ def main() -> int:
 
     now = now_ist()
     hour = now.hour
-    report_name = "MORNING JOB SEARCH" if 4 <= hour < 15 else "EVENING JOB SEARCH"
+    edition = "MORNING" if 4 <= hour < 15 else "EVENING"
+    report_name = f"JOB RADAR — {edition} EDITION"
     state = load_state()
     reported = set(state.get("reported", []))
 
     all_items: dict[str, dict] = {}
     for query in QUERIES:
         for item in fetch_query(query):
-            # Use a title/source key so the same article from multiple queries is only listed once.
             key = item["key"]
             if key not in all_items or (
                 item["published"] and
@@ -172,42 +269,10 @@ def main() -> int:
     items.sort(key=lambda x: x["published"] or dt.datetime.min.replace(tzinfo=IST), reverse=True)
     new_items = [x for x in items if x["key"] not in reported][:MAX_ITEMS]
 
-    lines = [
-        f"{report_name} — {now.strftime('%d %b %Y, %I:%M %p IST')}",
-        "",
-        "Target: Lucknow + ~100 km, remote India, and suitable India-wide roles.",
-        "Focus: software/backend, Python, AI/ML, data, FDE/technical consulting, research, government/PSU, startups, internships, walk-ins and paid projects.",
-        "",
-        "IMPORTANT: These are discovery leads from Google News RSS, NOT verified-open vacancies. Confirm eligibility, deadline, employer and application portal on the original source before applying.",
-        "",
-    ]
-
-    if not new_items:
-        lines.append("No new matching headlines were found in this run. This does not mean there are no open jobs.")
-    else:
-        lines.append(f"New leads: {len(new_items)}")
-        for index, item in enumerate(new_items, 1):
-            date_label = item["published"].strftime("%d %b %Y %I:%M %p IST") if item["published"] else "Date not supplied"
-            lines.extend([
-                "",
-                f"{index}. {item['title']}",
-                f"Publisher: {item['source']} | Published: {date_label}",
-                f"Status: UNVERIFIED LEAD — deadline, eligibility and current application status not confirmed.",
-                f"Discovery link: {item['link']}",
-            ])
-            if item["description"]:
-                lines.append(f"Snippet: {item['description'][:240]}")
-        lines.extend([
-            "",
-            "Next action: open each source, verify the original employer notice and deadline, then apply only if eligible.",
-        ])
-
-    lines.extend([
-        "",
-        "Searches use public Google News RSS queries. Coverage is broad but not exhaustive; login-only sources and some social posts are not indexed.",
-    ])
-    message = "\n".join(lines)
-    telegram_send(message)
+    messages = build_messages(edition, now, new_items)
+    for msg in messages:
+        telegram_send(msg)
+        time.sleep(1)
 
     # Persist keys only after successful Telegram delivery.
     state["reported"] = (state.get("reported", []) + [x["key"] for x in new_items])[-STATE_MAX:]
