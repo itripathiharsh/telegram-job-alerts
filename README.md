@@ -21,7 +21,7 @@ GitHub Actions free usage limits apply. This does not require a paid API, but ex
 4. Under **Repository secrets**, add:
    - `TELEGRAM_BOT_TOKEN`: the token from @BotFather. Keep it secret; do not put it in code or commit it.
 5. Under **Repository variables**, add:
-   - `TELEGRAM_CHAT_ID`: `5201957203`
+   - `TELEGRAM_CHAT_ID`: `xxxxxxxxxx`
 6. Open **Settings → Actions → General → Workflow permissions** and select **Read and write permissions**, then save. This allows the workflow to commit its deduplication state. If you prefer not to allow write access, remove the state-commit step from the workflow; deduplication will not persist reliably between runs.
 7. Open **Actions**, enable workflows if GitHub asks, choose **Telegram Job Alerts**, then click **Run workflow**.
 8. Open the run and check the logs. A successful run should send a message to Telegram and commit updated `job_alerts/state.json`.
